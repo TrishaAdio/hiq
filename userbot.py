@@ -1,11 +1,19 @@
 """Telethon userbot that locks and cleans every administered group.
 
-Send `.doall` from your own account. In every group where the account has
-sufficient admin rights, it:
-  1. Disables all messages from non-admins.
-  2. Finds non-admins who have posted media.
-  3. Deletes every text and media message those users sent.
-  4. Bans those users.
+Commands (send from your own account):
+
+  .doall  In every group where the account has admin rights:
+            1. Disables all messages from non-admins.
+            2. Finds non-admins who have posted media.
+            3. Deletes every text and media message those users sent.
+            4. Bans those users.
+
+  .dela   In every group where the account has admin rights:
+            1. Deletes join/leave service messages (joined via link,
+               joined group, left group, joined by request).
+            2. Promotes the account to anonymous admin.
+            3. Sends and pins a "Group cleaned!" message.
+          Reports how many groups succeeded and which ones failed.
 """
 
 import asyncio
@@ -21,9 +29,18 @@ from telethon.errors import (
     UserAdminInvalidError,
     UserNotParticipantError,
 )
-from telethon.tl.functions.channels import EditBannedRequest
+from telethon.tl.functions.channels import EditAdminRequest, EditBannedRequest
 from telethon.tl.functions.messages import EditChatDefaultBannedRightsRequest
-from telethon.tl.types import ChannelParticipantsAdmins, ChatBannedRights, User
+from telethon.tl.types import (
+    ChannelParticipantsAdmins,
+    ChatAdminRights,
+    ChatBannedRights,
+    MessageActionChatAddUser,
+    MessageActionChatDeleteUser,
+    MessageActionChatJoinedByLink,
+    MessageActionChatJoinedByRequest,
+    User,
+)
 
 load_dotenv()
 
@@ -69,6 +86,27 @@ LOCK_RIGHTS = ChatBannedRights(
 )
 BAN_RIGHTS = ChatBannedRights(until_date=None, view_messages=True)
 DELETE_BATCH_SIZE = 100
+
+# Service-message actions removed by `.dela` (membership churn).
+JOIN_LEAVE_ACTIONS = (
+    MessageActionChatJoinedByLink,
+    MessageActionChatJoinedByRequest,
+    MessageActionChatAddUser,
+    MessageActionChatDeleteUser,
+)
+
+# Admin rights granted when promoting the account to an anonymous admin.
+ANON_ADMIN_RIGHTS = ChatAdminRights(
+    change_info=True,
+    delete_messages=True,
+    ban_users=True,
+    invite_users=True,
+    pin_messages=True,
+    add_admins=False,
+    anonymous=True,
+    manage_call=True,
+)
+CLEANED_MESSAGE = "Group cleaned!"
 
 
 async def i_am_admin(chat) -> bool:
@@ -251,13 +289,127 @@ async def doall(event):
     )
 
 
+async def delete_service_messages(chat) -> int:
+    """Delete join/leave service messages from a group's history."""
+    deleted = 0
+    batch: list[int] = []
+    async for message in client.iter_messages(chat):
+        action = getattr(message, "action", None)
+        if not isinstance(action, JOIN_LEAVE_ACTIONS):
+            continue
+        batch.append(message.id)
+        if len(batch) == DELETE_BATCH_SIZE:
+            deleted += await delete_message_batch(chat, batch)
+            batch = []
+
+    if batch:
+        deleted += await delete_message_batch(chat, batch)
+    return deleted
+
+
+async def promote_to_anonymous(chat, user_id: int) -> bool:
+    """Promote the account to an anonymous admin. Best-effort."""
+    while True:
+        try:
+            await client(
+                EditAdminRequest(
+                    chat,
+                    user_id,
+                    ANON_ADMIN_RIGHTS,
+                    rank="",
+                )
+            )
+            return True
+        except FloodWaitError as error:
+            log.warning("Flood wait %ss promoting to anonymous", error.seconds)
+            await asyncio.sleep(error.seconds + 1)
+        except Exception as error:  # noqa: BLE001
+            log.warning("Could not promote to anonymous: %s", error)
+            return False
+
+
+async def send_and_pin(chat) -> bool:
+    """Send the 'cleaned' notice and pin it. Best-effort."""
+    while True:
+        try:
+            message = await client.send_message(chat, CLEANED_MESSAGE)
+            await client.pin_message(chat, message, notify=False)
+            return True
+        except FloodWaitError as error:
+            log.warning("Flood wait %ss sending/pinning notice", error.seconds)
+            await asyncio.sleep(error.seconds + 1)
+        except Exception as error:  # noqa: BLE001
+            log.warning("Could not send/pin notice: %s", error)
+            return False
+
+
+async def clean_group(chat, me_id: int) -> tuple[int, bool, bool]:
+    """Delete churn, go anonymous, pin notice. Return deleted, anon, pinned."""
+    deleted = await delete_service_messages(chat)
+    anonymous = await promote_to_anonymous(chat, me_id)
+    pinned = await send_and_pin(chat)
+    return deleted, anonymous, pinned
+
+
+@client.on(
+    events.NewMessage(
+        outgoing=True,
+        pattern=rf"^{re.escape(PREFIX)}dela$",
+    )
+)
+async def dela(event):
+    await event.edit("Cleaning groups…")
+    me = await client.get_me()
+
+    groups = 0
+    succeeded = 0
+    total_deleted = 0
+    failed: list[str] = []
+
+    async for dialog in client.iter_dialogs():
+        if not dialog.is_group or not await i_am_admin(dialog.entity):
+            continue
+
+        groups += 1
+        try:
+            deleted, anonymous, pinned = await clean_group(dialog.entity, me.id)
+            total_deleted += deleted
+            if anonymous and pinned:
+                succeeded += 1
+            else:
+                failed.append(dialog.name)
+            log.info(
+                "%s: deleted=%s anonymous=%s pinned=%s",
+                dialog.name,
+                deleted,
+                anonymous,
+                pinned,
+            )
+        except FloodWaitError as error:
+            await asyncio.sleep(error.seconds + 1)
+            failed.append(dialog.name)
+        except Exception as error:  # noqa: BLE001
+            log.warning("Skipped %s: %s", dialog.name, error)
+            failed.append(dialog.name)
+
+    report = (
+        f"Done. Groups: {groups} | Cleaned: {succeeded} | "
+        f"Service msgs deleted: {total_deleted}"
+    )
+    if failed:
+        preview = ", ".join(failed[:10]) + ("…" if len(failed) > 10 else "")
+        report += f"\nFailed ({len(failed)}): {preview}"
+    await event.edit(report)
+
+
 async def main():
     await client.start()
     me = await client.get_me()
     log.info(
-        "Logged in as %s (id %s). Send %sdoall to run.",
+        "Logged in as %s (id %s). Commands: %sdoall  %sdela",
         me.first_name,
         me.id,
+        PREFIX,
         PREFIX,
     )
     await client.run_until_disconnected()
