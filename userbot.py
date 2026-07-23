@@ -428,18 +428,51 @@ async def dela(event):
     await event.edit(report)
 
 
+async def resolve_user_id(user_id: int):
+    """Resolve a bare numeric user id into a bannable input entity.
+
+    A userbot session usually lacks a user's access hash, so `get_entity(id)`
+    fails even if you have chatted with them. This tries, in order:
+      1. the session cache,
+      2. priming the cache by loading dialogs (covers DMs), then retrying,
+      3. scanning the participants of every group for a matching id.
+    """
+    try:
+        return await client.get_input_entity(user_id)
+    except (ValueError, TypeError):
+        pass
+
+    try:
+        await client.get_dialogs()
+        return await client.get_input_entity(user_id)
+    except Exception:  # noqa: BLE001
+        pass
+
+    async for dialog in client.iter_dialogs():
+        if not dialog.is_group:
+            continue
+        try:
+            async for participant in client.iter_participants(dialog.entity):
+                if participant.id == user_id:
+                    return participant
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
 async def resolve_target(event):
     """Resolve a ban target from the command argument or a replied message.
 
-    Returns a user entity/id suitable for banning, or None if unresolved.
+    Returns a user entity/input-entity suitable for banning, or None.
     """
     arg = (event.pattern_match.group(1) or "").strip()
 
     if arg:
-        # Numeric id (optionally negative) or @username / t.me link / name.
-        lookup = int(arg) if arg.lstrip("-").isdigit() else arg
+        if arg.lstrip("-").isdigit():
+            return await resolve_user_id(int(arg))
+        # @username, t.me link, or a resolvable name.
         try:
-            return await client.get_entity(lookup)
+            return await client.get_entity(arg)
         except Exception as error:  # noqa: BLE001
             log.warning("Could not resolve %r: %s", arg, error)
             return None
@@ -449,7 +482,7 @@ async def resolve_target(event):
         try:
             return await reply.get_sender()
         except Exception:  # noqa: BLE001
-            return reply.sender_id
+            return await resolve_user_id(reply.sender_id)
     return None
 
 
@@ -467,7 +500,12 @@ async def ban_everywhere(event):
         )
         return
 
-    label = getattr(target, "username", None) or getattr(target, "id", target)
+    username = getattr(target, "username", None)
+    label = (
+        f"@{username}"
+        if username
+        else getattr(target, "id", None) or getattr(target, "user_id", None) or "user"
+    )
     await event.edit(f"Banning {label} across every group you administer…")
 
     groups = 0
