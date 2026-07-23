@@ -4,9 +4,10 @@ Commands (send from your own account):
 
   .doall  In every group where the account has admin rights:
             1. Disables all messages from non-admins.
-            2. Finds non-admins who have posted media.
-            3. Deletes every text and media message those users sent.
-            4. Bans those users.
+            2. Deletes the messages of every non-admin who posted.
+            3. Bans the non-admins who posted media (text-only
+               senders are not banned -- their messages are just
+               deleted).
 
   .dela   In every group where the account has admin rights:
             1. Deletes join/leave service messages (joined via link,
@@ -171,28 +172,42 @@ async def ban_user(chat, user_id: int) -> bool:
             return False
 
 
-async def find_media_offenders(chat, admin_ids: set[int]) -> set[int]:
-    """Find non-admin human users who posted at least one media message."""
-    offenders: set[int] = set()
-    checked_users: set[int] = set()
+async def classify_non_admin_senders(
+    chat, admin_ids: set[int]
+) -> tuple[set[int], set[int]]:
+    """Classify non-admin human senders by what they posted.
+
+    Returns (text_only, media_senders):
+      - media_senders: posted at least one media message.
+      - text_only: only ever posted text (never media).
+    Service messages (joins/leaves) are ignored here.
+    """
+    media_senders: set[int] = set()
+    text_senders: set[int] = set()
+    is_human: dict[int, bool] = {}
 
     async for message in client.iter_messages(chat):
-        sender_id = message.sender_id
-        if (
-            not message.media
-            or sender_id is None
-            or sender_id < 0
-            or sender_id in admin_ids
-            or sender_id in checked_users
-        ):
+        # Skip service messages; those are handled by `.dela`.
+        if getattr(message, "action", None) is not None:
             continue
 
-        checked_users.add(sender_id)
-        sender = await message.get_sender()
-        if isinstance(sender, User) and not sender.bot:
-            offenders.add(sender_id)
+        sender_id = message.sender_id
+        if sender_id is None or sender_id < 0 or sender_id in admin_ids:
+            continue
 
-    return offenders
+        if sender_id not in is_human:
+            sender = await message.get_sender()
+            is_human[sender_id] = isinstance(sender, User) and not sender.bot
+        if not is_human[sender_id]:
+            continue
+
+        if message.media:
+            media_senders.add(sender_id)
+        elif message.text:
+            text_senders.add(sender_id)
+
+    text_only = text_senders - media_senders
+    return text_only, media_senders
 
 
 async def delete_message_batch(chat, message_ids: list[int]) -> int:
@@ -230,16 +245,23 @@ async def delete_offender_messages(chat, offenders: set[int]) -> int:
 
 
 async def process_group(chat, me_id: int) -> tuple[int, int, bool]:
-    """Lock, purge, and ban in one group. Return banned, deleted, locked."""
+    """Lock, purge, and ban in one group. Return banned, deleted, locked.
+
+    Text-only senders have their messages deleted. Media senders have their
+    messages deleted and are also banned.
+    """
     locked = await lock_group(chat)
 
     admin_ids = await get_admin_ids(chat)
     admin_ids.add(me_id)
-    offenders = await find_media_offenders(chat, admin_ids)
+    text_only, media_senders = await classify_non_admin_senders(chat, admin_ids)
 
-    deleted = await delete_offender_messages(chat, offenders)
+    # Delete messages from every non-admin poster (text-only and media alike).
+    deleted = await delete_offender_messages(chat, text_only | media_senders)
+
+    # Ban only the media senders.
     banned = 0
-    for user_id in offenders:
+    for user_id in media_senders:
         if await ban_user(chat, user_id):
             banned += 1
 
