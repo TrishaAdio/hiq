@@ -15,6 +15,10 @@ Commands (send from your own account):
             2. Promotes the account to anonymous admin.
             3. Sends and pins a "Group cleaned!" message.
           Reports how many groups succeeded and which ones failed.
+
+  .ban    Ban a user from every group the account administers.
+          Target the user by `.ban @username`, `.ban <user_id>`, or
+          by replying to one of their messages with `.ban`.
 """
 
 import asyncio
@@ -424,13 +428,84 @@ async def dela(event):
     await event.edit(report)
 
 
+async def resolve_target(event):
+    """Resolve a ban target from the command argument or a replied message.
+
+    Returns a user entity/id suitable for banning, or None if unresolved.
+    """
+    arg = (event.pattern_match.group(1) or "").strip()
+
+    if arg:
+        # Numeric id (optionally negative) or @username / t.me link / name.
+        lookup = int(arg) if arg.lstrip("-").isdigit() else arg
+        try:
+            return await client.get_entity(lookup)
+        except Exception as error:  # noqa: BLE001
+            log.warning("Could not resolve %r: %s", arg, error)
+            return None
+
+    reply = await event.get_reply_message()
+    if reply and reply.sender_id and reply.sender_id > 0:
+        try:
+            return await reply.get_sender()
+        except Exception:  # noqa: BLE001
+            return reply.sender_id
+    return None
+
+
+@client.on(
+    events.NewMessage(
+        outgoing=True,
+        pattern=rf"^{re.escape(PREFIX)}ban(?:\s+(.+))?$",
+    )
+)
+async def ban_everywhere(event):
+    target = await resolve_target(event)
+    if target is None:
+        await event.edit(
+            f"Usage: {PREFIX}ban <@username|id> — or reply to a user with {PREFIX}ban"
+        )
+        return
+
+    label = getattr(target, "username", None) or getattr(target, "id", target)
+    await event.edit(f"Banning {label} across every group you administer…")
+
+    groups = 0
+    banned = 0
+    failed: list[str] = []
+
+    async for dialog in client.iter_dialogs():
+        if not dialog.is_group or not await i_am_admin(dialog.entity):
+            continue
+
+        groups += 1
+        try:
+            if await ban_user(dialog.entity, target):
+                banned += 1
+            else:
+                failed.append(dialog.name)
+        except FloodWaitError as error:
+            await asyncio.sleep(error.seconds + 1)
+            failed.append(dialog.name)
+        except Exception as error:  # noqa: BLE001
+            log.warning("Ban failed in %s: %s", dialog.name, error)
+            failed.append(dialog.name)
+
+    report = f"Done. Banned {label} in {banned}/{groups} group(s)."
+    if failed:
+        preview = ", ".join(failed[:10]) + ("…" if len(failed) > 10 else "")
+        report += f"\nFailed ({len(failed)}): {preview}"
+    await event.edit(report)
+
+
 async def main():
     await client.start()
     me = await client.get_me()
     log.info(
-        "Logged in as %s (id %s). Commands: %sdoall  %sdela",
+        "Logged in as %s (id %s). Commands: %sdoall  %sdela  %sban",
         me.first_name,
         me.id,
+        PREFIX,
         PREFIX,
         PREFIX,
     )
