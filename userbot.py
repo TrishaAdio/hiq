@@ -1,27 +1,17 @@
-"""
-Telethon userbot: one command does everything.
+"""Telethon userbot that locks and cleans every administered group.
 
-Send `.doall` from your own account (in any chat) and it will, for every
-group where your account is an admin:
-  1. Turn off the "only admins can send messages" restriction
-  2. Scan the group's history and ban every non-admin who posted media
-
-Telegram only allows these actions where you're an admin with the matching
-rights, so it silently skips groups where you aren't.
-
-Setup:
-  1. cp .env.example .env  and fill in API_ID / API_HASH
-     (get them from https://my.telegram.org -> API development tools)
-  2. pip install -r requirements.txt
-  3. python userbot.py   (first run asks for your phone + login code)
-
-Note: automating a personal account ("userbot"/"self-bot") is against
-Telegram's Terms of Service. Only use it on groups you administer.
+Send `.doall` from your own account. In every group where the account has
+sufficient admin rights, it:
+  1. Disables all messages from non-admins.
+  2. Finds non-admins who have posted media.
+  3. Deletes every text and media message those users sent.
+  4. Bans those users.
 """
 
 import asyncio
 import logging
 import os
+import re
 
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
@@ -57,14 +47,34 @@ if not API_ID or not API_HASH:
 
 client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
-# Rights object that fully bans (kicks + blocks) a user.
+# Default restrictions for non-admins. Explicit content flags cover both older
+# and newer Telegram API layers, including plain text and every media type.
+LOCK_RIGHTS = ChatBannedRights(
+    until_date=None,
+    send_messages=True,
+    send_media=True,
+    send_stickers=True,
+    send_gifs=True,
+    send_games=True,
+    send_inline=True,
+    embed_links=True,
+    send_polls=True,
+    send_photos=True,
+    send_videos=True,
+    send_roundvideos=True,
+    send_audios=True,
+    send_voices=True,
+    send_docs=True,
+    send_plain=True,
+)
 BAN_RIGHTS = ChatBannedRights(until_date=None, view_messages=True)
+DELETE_BATCH_SIZE = 100
 
 
 async def i_am_admin(chat) -> bool:
     try:
-        perms = await client.get_permissions(chat, "me")
-        return bool(perms and perms.is_admin)
+        permissions = await client.get_permissions(chat, "me")
+        return bool(permissions and permissions.is_admin)
     except Exception:  # noqa: BLE001
         return False
 
@@ -81,10 +91,23 @@ async def get_admin_ids(chat) -> set[int]:
     return admins
 
 
-async def unlock_group(chat) -> None:
-    """Remove the 'only admins can send messages' restriction."""
-    rights = ChatBannedRights(until_date=None, send_messages=False)
-    await client(EditChatDefaultBannedRightsRequest(peer=chat, banned_rights=rights))
+async def lock_group(chat) -> bool:
+    """Disable text and media posting for all non-admin members."""
+    while True:
+        try:
+            await client(
+                EditChatDefaultBannedRightsRequest(
+                    peer=chat,
+                    banned_rights=LOCK_RIGHTS,
+                )
+            )
+            return True
+        except FloodWaitError as error:
+            log.warning("Flood wait %ss locking group", error.seconds)
+            await asyncio.sleep(error.seconds + 1)
+        except Exception as error:  # noqa: BLE001
+            log.warning("Could not lock group: %s", error)
+            return False
 
 
 async def ban_user(chat, user_id: int) -> bool:
@@ -92,84 +115,151 @@ async def ban_user(chat, user_id: int) -> bool:
         try:
             await client(EditBannedRequest(chat, user_id, BAN_RIGHTS))
             return True
-        except FloodWaitError as e:
-            log.warning("Flood wait %ss banning %s -- sleeping", e.seconds, user_id)
-            await asyncio.sleep(e.seconds + 1)
-        except (UserAdminInvalidError, UserNotParticipantError, ChatAdminRequiredError):
+        except FloodWaitError as error:
+            log.warning(
+                "Flood wait %ss banning %s -- sleeping",
+                error.seconds,
+                user_id,
+            )
+            await asyncio.sleep(error.seconds + 1)
+        except (
+            UserAdminInvalidError,
+            UserNotParticipantError,
+            ChatAdminRequiredError,
+        ):
             return False
-        except Exception as e:  # noqa: BLE001
-            log.warning("Could not ban %s: %s", user_id, e)
+        except Exception as error:  # noqa: BLE001
+            log.warning("Could not ban %s: %s", user_id, error)
             return False
 
 
-async def process_group(chat, me_id: int) -> tuple[int, bool]:
-    """Unlock + scan-and-ban one group. Returns (banned_count, unlocked)."""
-    unlocked = False
-    try:
-        await unlock_group(chat)
-        unlocked = True
-    except FloodWaitError as e:
-        await asyncio.sleep(e.seconds + 1)
-    except Exception as e:  # noqa: BLE001
-        log.warning("unlock failed: %s", e)
-
-    admins = await get_admin_ids(chat)
-    admins.add(me_id)
-
+async def find_media_offenders(chat, admin_ids: set[int]) -> set[int]:
+    """Find non-admin human users who posted at least one media message."""
     offenders: set[int] = set()
-    async for msg in client.iter_messages(chat):
-        if not msg.media:
-            continue
-        sender_id = msg.sender_id
-        if sender_id is None or sender_id < 0 or sender_id in admins:
-            continue
-        sender = await msg.get_sender()
-        if not isinstance(sender, User) or sender.bot:
-            continue
-        offenders.add(sender_id)
+    checked_users: set[int] = set()
 
+    async for message in client.iter_messages(chat):
+        sender_id = message.sender_id
+        if (
+            not message.media
+            or sender_id is None
+            or sender_id < 0
+            or sender_id in admin_ids
+            or sender_id in checked_users
+        ):
+            continue
+
+        checked_users.add(sender_id)
+        sender = await message.get_sender()
+        if isinstance(sender, User) and not sender.bot:
+            offenders.add(sender_id)
+
+    return offenders
+
+
+async def delete_message_batch(chat, message_ids: list[int]) -> int:
+    """Delete one batch and return the number accepted by Telegram."""
+    while True:
+        try:
+            await client.delete_messages(chat, message_ids, revoke=True)
+            return len(message_ids)
+        except FloodWaitError as error:
+            log.warning("Flood wait %ss deleting messages", error.seconds)
+            await asyncio.sleep(error.seconds + 1)
+        except Exception as error:  # noqa: BLE001
+            log.warning("Could not delete %s message(s): %s", len(message_ids), error)
+            return 0
+
+
+async def delete_offender_messages(chat, offenders: set[int]) -> int:
+    """Delete every text, media, and service message sent by offenders."""
+    if not offenders:
+        return 0
+
+    deleted = 0
+    batch: list[int] = []
+    async for message in client.iter_messages(chat):
+        if message.sender_id not in offenders:
+            continue
+        batch.append(message.id)
+        if len(batch) == DELETE_BATCH_SIZE:
+            deleted += await delete_message_batch(chat, batch)
+            batch = []
+
+    if batch:
+        deleted += await delete_message_batch(chat, batch)
+    return deleted
+
+
+async def process_group(chat, me_id: int) -> tuple[int, int, bool]:
+    """Lock, purge, and ban in one group. Return banned, deleted, locked."""
+    locked = await lock_group(chat)
+
+    admin_ids = await get_admin_ids(chat)
+    admin_ids.add(me_id)
+    offenders = await find_media_offenders(chat, admin_ids)
+
+    deleted = await delete_offender_messages(chat, offenders)
     banned = 0
-    for uid in offenders:
-        if await ban_user(chat, uid):
+    for user_id in offenders:
+        if await ban_user(chat, user_id):
             banned += 1
-    return banned, unlocked
+
+    return banned, deleted, locked
 
 
-@client.on(events.NewMessage(outgoing=True, pattern=rf"^{PREFIX}doall$"))
-async def _doall(event):
-    await event.edit("Working through every group you administer…")
+@client.on(
+    events.NewMessage(
+        outgoing=True,
+        pattern=rf"^{re.escape(PREFIX)}doall$",
+    )
+)
+async def doall(event):
+    await event.edit("Processing groups…")
     me = await client.get_me()
 
     groups = 0
-    unlocked = 0
+    locked = 0
     total_banned = 0
+    total_deleted = 0
+
     async for dialog in client.iter_dialogs():
-        if not dialog.is_group:
+        if not dialog.is_group or not await i_am_admin(dialog.entity):
             continue
-        entity = dialog.entity
-        if not await i_am_admin(entity):
-            continue
+
         groups += 1
         try:
-            banned, was_unlocked = await process_group(entity, me.id)
+            banned, deleted, was_locked = await process_group(dialog.entity, me.id)
             total_banned += banned
-            unlocked += int(was_unlocked)
-            log.info("%s: unlocked=%s banned=%s", dialog.name, was_unlocked, banned)
-        except FloodWaitError as e:
-            await asyncio.sleep(e.seconds + 1)
-        except Exception as e:  # noqa: BLE001
-            log.warning("skip %s: %s", dialog.name, e)
+            total_deleted += deleted
+            locked += int(was_locked)
+            log.info(
+                "%s: locked=%s deleted=%s banned=%s",
+                dialog.name,
+                was_locked,
+                deleted,
+                banned,
+            )
+        except FloodWaitError as error:
+            await asyncio.sleep(error.seconds + 1)
+        except Exception as error:  # noqa: BLE001
+            log.warning("Skipped %s: %s", dialog.name, error)
 
     await event.edit(
-        f"Done. {groups} group(s) processed — "
-        f"unlocked {unlocked}, banned {total_banned} non-admin(s)."
+        f"Done. Groups: {groups} | Locked: {locked} | "
+        f"Deleted: {total_deleted} | Banned: {total_banned}"
     )
 
 
 async def main():
     await client.start()
     me = await client.get_me()
-    log.info("Logged in as %s (id %s). Send %sdoall to run.", me.first_name, me.id, PREFIX)
+    log.info(
+        "Logged in as %s (id %s). Send %sdoall to run.",
+        me.first_name,
+        me.id,
+        PREFIX,
+    )
     await client.run_until_disconnected()
 
 
